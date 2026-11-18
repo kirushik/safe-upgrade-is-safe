@@ -5,6 +5,7 @@ import {Script} from "forge-std/Script.sol";
 import {console2} from "forge-std/console2.sol";
 import {ISafe} from "../src/ISafe.sol";
 import {SafeConstants as C} from "../src/SafeConstants.sol";
+import {SafeVersions as V} from "../src/SafeVersions.sol";
 
 /// Shared plumbing for the two dry-run phases: report output, Safe state snapshots,
 /// EIP-712 hashing and the "owners approve on-chain" signature scheme.
@@ -42,7 +43,17 @@ abstract contract DryRunBase is Script {
         bytes32 proxyCodehash;
     }
 
+    address internal constant RECIPIENT = address(uint160(uint256(keccak256("safe-dryrun recipient"))));
+
     ISafe internal safe;
+    /// Upgrade target chosen on the command line.
+    V.Target internal tgt;
+    bool internal wantL2;
+    /// Extended test suite requested (--full), and the tokens it should try to move.
+    bool internal full;
+    address[] internal tokens;
+    /// Owners used to authorise transactions on the fork; see _pickSigners.
+    address[] internal signers;
     string internal runDir;
     string private reportPath;
     uint256 internal passes;
@@ -57,6 +68,10 @@ abstract contract DryRunBase is Script {
             "refusing to run: chain id is not the local fork's (31337). This tool only ever talks to its own Anvil."
         );
         safe = ISafe(vm.envAddress("SAFE"));
+        tgt = V.target(vm.envOr("TARGET", string("1.5.0")));
+        wantL2 = vm.envOr("TARGET_L2", false);
+        full = vm.envOr("FULL", false);
+        tokens = vm.envOr("TOKENS", ",", new address[](0));
         runDir = vm.envString("RUN_DIR");
         reportPath = string.concat(runDir, "/report-", phase, ".txt");
         if (vm.exists(reportPath)) vm.removeFile(reportPath);
@@ -131,11 +146,14 @@ abstract contract DryRunBase is Script {
 
     function _name(address a) internal view returns (string memory) {
         if (a == address(safe)) return "this Safe";
-        if (a == C.SAFE_111) return "Safe 1.1.1 singleton";
-        if (a == C.SAFE_150) return "Safe 1.5.0 singleton";
-        if (a == C.SAFE_L2_150) return "SafeL2 1.5.0 singleton";
+        V.Source memory s = V.source(a);
+        if (s.known) return string.concat(s.l2 ? "SafeL2 " : "Safe ", s.version, " singleton");
         if (a == C.DEFAULT_CALLBACK_HANDLER_111) return "DefaultCallbackHandler 1.1.1";
+        if (a == C.COMPAT_FALLBACK_HANDLER_130) return "CompatibilityFallbackHandler 1.3.0";
+        if (a == C.COMPAT_FALLBACK_HANDLER_130_EIP155) return "CompatibilityFallbackHandler 1.3.0 eip155";
+        if (a == C.COMPAT_FALLBACK_HANDLER_141) return "CompatibilityFallbackHandler 1.4.1";
         if (a == C.COMPAT_FALLBACK_HANDLER_150) return "CompatibilityFallbackHandler 1.5.0";
+        if (a == C.SAFE_MIGRATION_141) return "SafeMigration 1.4.1";
         if (a == C.SAFE_MIGRATION_150) return "SafeMigration 1.5.0";
         if (a == C.MULTISEND_CALL_ONLY_130) return "MultiSendCallOnly 1.3.0";
         if (a == C.MULTISEND_CALL_ONLY_130_EIP155) return "MultiSendCallOnly 1.3.0 eip155";
@@ -317,9 +335,9 @@ abstract contract DryRunBase is Script {
 
     /// "Pre-validated" signatures (v = 1): valid for an owner that is msg.sender or has called
     /// approveHash. No private key is involved anywhere.
-    function _approvedSignatures(address[] memory signers) internal pure returns (bytes memory sigs) {
-        for (uint256 i; i < signers.length; i++) {
-            sigs = abi.encodePacked(sigs, bytes32(uint256(uint160(signers[i]))), bytes32(0), uint8(1));
+    function _approvedSignatures(address[] memory set) internal pure returns (bytes memory sigs) {
+        for (uint256 i; i < set.length; i++) {
+            sigs = abi.encodePacked(sigs, bytes32(uint256(uint160(set[i]))), bytes32(0), uint8(1));
         }
     }
 
@@ -339,6 +357,56 @@ abstract contract DryRunBase is Script {
                 sigs
             )
         );
+    }
+
+    // -------------------------------------------------------------- execution
+
+    /// Executes a Safe transaction on whatever version the Safe currently runs: every signer but
+    /// the first approves the hash on-chain (impersonated), the first submits. Returns false on
+    /// any failure, including the non-reverting inner failures of pre-1.3.0 Safes.
+    function _execWith(address[] memory set, SafeTx memory t, bytes32 hashToApprove) internal returns (bool ok) {
+        for (uint256 i = 1; i < set.length; i++) {
+            vm.prank(set[i]);
+            (ok,) = address(safe).call(abi.encodeCall(ISafe.approveHash, (hashToApprove)));
+        }
+        if (set.length > 0) vm.prank(set[0]);
+        bytes memory ret;
+        (ok, ret) = address(safe).call(_execCalldata(t, _approvedSignatures(set)));
+        if (ok) ok = abi.decode(ret, (bool));
+    }
+
+    function _plainTx(address to, uint256 value, bytes memory data, uint8 operation) internal view returns (SafeTx memory) {
+        return SafeTx(to, value, data, operation, 0, 0, 0, address(0), address(0), safe.nonce());
+    }
+
+    function _exec(address to, uint256 value, bytes memory data, uint8 operation) internal returns (bool) {
+        SafeTx memory t = _plainTx(to, value, data, operation);
+        return _execWith(signers, t, _onchainHash(t));
+    }
+
+    function _balanceOf(address token, address who) internal view returns (bool ok, uint256 balance) {
+        (bool s, bytes memory r) = token.staticcall(abi.encodeWithSelector(0x70a08231, who));
+        if (!s || r.length < 32) return (false, 0);
+        return (true, abi.decode(r, (uint256)));
+    }
+
+    /// Tries to move about 1% of the Safe's balance of `token` and undoes it again.
+    /// 0 = the Safe holds none, 1 = the transfer arrived, 2 = it did not.
+    function _tryTokenTransfer(address token) internal returns (uint256 status) {
+        (bool readable, uint256 held) = _balanceOf(token, address(safe));
+        if (!readable || held == 0) return 0;
+        uint256 amount = held >= 100 ? held / 100 : held;
+        uint256 snap = vm.snapshotState();
+        (, uint256 r0) = _balanceOf(token, RECIPIENT);
+        bool done = _exec(token, 0, abi.encodeWithSelector(0xa9059cbb, RECIPIENT, amount), 0);
+        (, uint256 r1) = _balanceOf(token, RECIPIENT);
+        (, uint256 left) = _balanceOf(token, address(safe));
+        vm.revertToState(snap);
+        return done && r1 > r0 && left < held ? 1 : 2;
+    }
+
+    function _targetSingleton() internal view returns (address) {
+        return wantL2 ? tgt.singletonL2 : tgt.singleton;
     }
 
     function _revertReason(bytes memory ret) internal pure returns (string memory) {

@@ -7,14 +7,25 @@ pragma solidity ^0.8.24;
 library SafeConstants {
     // --- singletons ---
     address internal constant SAFE_111 = 0x34CfAC646f301356fAa8B21e94227e3583Fe3F5F;
+    address internal constant SAFE_120 = 0x6851D6fDFAfD08c0295C392436245E5bc78B0185;
+    address internal constant SAFE_130 = 0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552;
+    address internal constant SAFE_130_EIP155 = 0x69f4D1788e39c87893C980c06EdF4b7f686e2938;
+    address internal constant SAFE_L2_130 = 0x3E5c63644E683549055b9Be8653de26E0B4CD36E;
+    address internal constant SAFE_L2_130_EIP155 = 0xfb1bffC9d739B8D520DaF37dF666da4C687191EA;
+    address internal constant SAFE_141 = 0x41675C099F32341bf84BFc5382aF534df5C7461a;
+    address internal constant SAFE_L2_141 = 0x29fcB43b46531BcA003ddC8FCB67FFE91900C762;
     address internal constant SAFE_150 = 0xFf51A5898e281Db6DfC7855790607438dF2ca44b;
     address internal constant SAFE_L2_150 = 0xEdd160fEBBD92E350D4D398fb636302fccd67C7e;
 
     // --- fallback handlers ---
     address internal constant DEFAULT_CALLBACK_HANDLER_111 = 0xd5D82B6aDDc9027B22dCA772Aa68D5d74cdBdF44;
+    address internal constant COMPAT_FALLBACK_HANDLER_130 = 0xf48f2B2d2a534e402487b3ee7C18c33Aec0Fe5e4;
+    address internal constant COMPAT_FALLBACK_HANDLER_130_EIP155 = 0x017062a1dE2FE6b99BE3d9d37841FeD19F573804;
+    address internal constant COMPAT_FALLBACK_HANDLER_141 = 0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99;
     address internal constant COMPAT_FALLBACK_HANDLER_150 = 0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4;
 
-    // --- migration helper (the route the Safe UI uses for 1.3.0+ Safes, not for 1.1.1) ---
+    // --- migration helpers: what the Safe UI delegatecalls to upgrade a 1.3.0+ Safe ---
+    address internal constant SAFE_MIGRATION_141 = 0x526643F69b81B008F46d95CD5ced5eC0edFFDaC6;
     address internal constant SAFE_MIGRATION_150 = 0x6439e7ABD8Bb915A5263094784C5CF561c4172AC;
 
     // --- MultiSendCallOnly (inner delegatecalls impossible) ---
@@ -30,10 +41,16 @@ library SafeConstants {
     address internal constant MULTISEND_141 = 0x38869bf66a61cF6bDB996A6aE40D5853Fd43B526;
     address internal constant MULTISEND_150 = 0x218543288004CD07832472D464648173c77D7eB7;
 
-    /// Runtime code hash of proxies created by the 1.1.1 ProxyFactory
-    /// (0x76E2cFc1F5Fa8F6a5b3fC4c8F4788F0116861F9B). Observed on mainnet, not taken from Safe docs.
+    /// Runtime code hashes of the proxies the official factories create. Observed on mainnet Safes,
+    /// not taken from Safe documentation.
     bytes32 internal constant PROXY_111_CODEHASH =
         0xaea7d4252f6245f301e540cfbee27d3a88de543af8e49c5c62405d5499fab7e5;
+    bytes32 internal constant PROXY_130_CODEHASH =
+        0xb89c1b3bdf2cf8827818646bce9a8f6e372885f8c55e5c07acbd307cb133b000;
+    bytes32 internal constant PROXY_141_CODEHASH =
+        0xd7d408ebcd99b2b70be43e20253d6d92a8ea8fab29bd3be7f55b10032331fb4c;
+    bytes32 internal constant PROXY_150_CODEHASH =
+        0x4e381985ca68b3e5d27b4425fa581c19cf33146d3f887a3cfca96f55528ea46f;
 
     // --- storage slots (identical layout in 1.1.1 and 1.5.0) ---
     uint256 internal constant SLOT_SINGLETON = 0;

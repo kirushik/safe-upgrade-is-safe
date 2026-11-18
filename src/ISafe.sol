@@ -44,6 +44,9 @@ interface ISafe {
     function addOwnerWithThreshold(address owner, uint256 _threshold) external;
     function removeOwner(address prevOwner, address owner, uint256 _threshold) external;
     function enableModule(address module) external;
+    function changeThreshold(uint256 _threshold) external;
+    function swapOwner(address prevOwner, address oldOwner, address newOwner) external;
+    function setGuard(address guard) external;
     function execTransactionFromModule(address to, uint256 value, bytes calldata data, uint8 operation)
         external
         returns (bool success);

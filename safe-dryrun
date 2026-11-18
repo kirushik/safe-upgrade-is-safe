@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# Rehearse a Safe 1.1.1 -> 1.5.0 upgrade on a private Anvil fork of mainnet.
+#
+# Safety properties this script maintains:
+#   * mainnet is only ever READ (state via ETH_RPC_URL, queued transactions via the Safe
+#     Transaction Service); every write goes to an Anvil instance bound to 127.0.0.1
+#   * the fork runs with chain id 31337, so no wallet can mistake it for mainnet
+#   * no private key or real signature is involved: owners are impersonated on the fork
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$ROOT"
+
+FORK_CHAIN_ID=31337
+ZERO=0x0000000000000000000000000000000000000000
+TX_SERVICE=${SAFE_TX_SERVICE_URL:-https://api.safe.global/tx-service/eth}
+DEPLOYMENTS_RAW=https://raw.githubusercontent.com/safe-global/safe-deployments/main/src/assets
+
+usage() {
+  cat <<'EOF'
+Usage:
+  safe-dryrun <safe-address> [options]   rehearse the upgrade of one Safe
+  safe-dryrun doctor                     re-check the built-in contract addresses
+
+Which transaction is rehearsed (pick one; default is the first):
+  (default)            the queued transaction at the Safe's current nonce, read from the
+                       Safe Transaction Service (i.e. what the Safe UI proposed)
+  --tx-hash <hash>     a specific queued transaction, by safeTxHash
+  --tx-file <path>     a transaction from a JSON file with the fields
+                       to, value, data, operation, safeTxGas, baseGas, gasPrice,
+                       gasToken, refundReceiver, nonce (missing ones default to zero)
+  --reference          nothing has been proposed yet: rehearse the upgrade batch the
+                       Safe UI is expected to build
+
+Other options:
+  --block <number>     fork at this block instead of the latest one
+  --keep               leave the fork running afterwards for manual inspection
+  -h, --help           this text
+
+Environment:
+  ETH_RPC_URL          mainnet RPC endpoint, read-only use (required; see .env.example)
+  SAFE_API_KEY         optional Safe Transaction Service API key
+EOF
+}
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' RESET=$'\e[0m'
+else
+  BOLD='' DIM='' RED='' GREEN='' YELLOW='' RESET=''
+fi
+
+die() { echo "${RED}error:${RESET} $*" >&2; exit 2; }
+note() { echo "${DIM}$*${RESET}" >&2; }
+
+colourise() {
+  sed -e "s/^\(== .* ==\)\$/${BOLD}\1${RESET}/" \
+      -e "s/\[ ok \]/[${GREEN} ok ${RESET}]/" \
+      -e "s/\[WARN\]/[${YELLOW}WARN${RESET}]/" \
+      -e "s/\[FAIL\]/[${RED}FAIL${RESET}]/"
+}
+
+need_tools() {
+  local t
+  for t in anvil forge cast jq curl; do
+    command -v "$t" >/dev/null || die "'$t' not found. Enter the dev shell first: 'direnv allow' or 'nix develop'."
+  done
+  [[ -n ${ETH_RPC_URL:-} ]] || die "ETH_RPC_URL is not set. Copy .env.example to .env and point it at a mainnet RPC."
+  local id
+  id=$(cast chain-id --rpc-url "$ETH_RPC_URL" 2>&1) || die "cannot reach ETH_RPC_URL ($(rpc_host)): $(head -1 <<<"$id")"
+  [[ $id == 1 ]] || die "ETH_RPC_URL is chain $id, expected Ethereum mainnet (1)"
+}
+
+rpc_host() { sed -E 's#^[a-z]+://([^/@]*@)?([^/:]+).*#\2#' <<<"$ETH_RPC_URL"; }
+
+# ----------------------------------------------------------------------------- doctor
+
+# constant name | safe-deployments version | file | variant
+DOCTOR_TABLE='SAFE_111|v1.1.1|gnosis_safe|canonical
+DEFAULT_CALLBACK_HANDLER_111|v1.1.1|default_callback_handler|canonical
+MULTISEND_111|v1.1.1|multi_send|canonical
+MULTISEND_130|v1.3.0|multi_send|canonical
+MULTISEND_130_EIP155|v1.3.0|multi_send|eip155
+MULTISEND_CALL_ONLY_130|v1.3.0|multi_send_call_only|canonical
+MULTISEND_CALL_ONLY_130_EIP155|v1.3.0|multi_send_call_only|eip155
+MULTISEND_141|v1.4.1|multi_send|canonical
+MULTISEND_CALL_ONLY_141|v1.4.1|multi_send_call_only|canonical
+SAFE_150|v1.5.0|safe|canonical
+SAFE_L2_150|v1.5.0|safe_l2|canonical
+COMPAT_FALLBACK_HANDLER_150|v1.5.0|compatibility_fallback_handler|canonical
+SAFE_MIGRATION_150|v1.5.0|safe_migration|canonical
+MULTISEND_150|v1.5.0|multi_send|canonical
+MULTISEND_CALL_ONLY_150|v1.5.0|multi_send_call_only|canonical'
+
+doctor() {
+  need_tools
+  echo "${BOLD}Checking built-in addresses against safe-global/safe-deployments and mainnet${RESET}"
+  local bad=0 name ver file variant ours json theirs hash_theirs hash_chain listed
+  while IFS='|' read -r name ver file variant; do
+    ours=$(sed -nE "s/.*address internal constant ${name} = (0x[0-9a-fA-F]{40});.*/\1/p" src/SafeConstants.sol)
+    [[ -n $ours ]] || { echo "  [FAIL] $name: constant not found in src/SafeConstants.sol" | colourise; bad=1; continue; }
+    if ! json=$(curl -fsS -m 30 "$DEPLOYMENTS_RAW/$ver/$file.json"); then
+      echo "  [FAIL] $name: could not download $ver/$file.json" | colourise; bad=1; continue
+    fi
+    theirs=$(jq -r --arg v "$variant" '.deployments[$v].address // empty' <<<"$json")
+    hash_theirs=$(jq -r --arg v "$variant" '.deployments[$v].codeHash // empty' <<<"$json")
+    listed=$(jq -r --arg v "$variant" '.networkAddresses["1"] | if type == "array" then index($v) != null else . == $v end' <<<"$json")
+    hash_chain=$(cast keccak "$(cast code "$ours" --rpc-url "$ETH_RPC_URL")")
+    if [[ ${ours,,} != "${theirs,,}" ]]; then
+      echo "  [FAIL] $name: $ours here, $theirs in safe-deployments $ver/$file.json" | colourise; bad=1
+    elif [[ $listed != true ]]; then
+      echo "  [FAIL] $name: safe-deployments does not list the $variant deployment for mainnet" | colourise; bad=1
+    elif [[ ${hash_chain,,} != "${hash_theirs,,}" ]]; then
+      echo "  [FAIL] $name: mainnet code hash $hash_chain differs from safe-deployments $hash_theirs" | colourise; bad=1
+    else
+      echo "  [ ok ] $name $ours (address and code hash match)" | colourise
+    fi
+  done <<<"$DOCTOR_TABLE"
+  exit $bad
+}
+
+# ------------------------------------------------------------------------------- args
+
+[[ $# -gt 0 ]] || { usage; exit 2; }
+case $1 in
+  -h|--help) usage; exit 0 ;;
+  doctor) doctor ;;
+esac
+
+SAFE_ARG=$1; shift
+TX_MODE=service TX_HASH='' TX_FILE='' BLOCK='' KEEP=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --tx-hash) TX_MODE=service; TX_HASH=${2:?--tx-hash needs a value}; shift 2 ;;
+    --tx-file) TX_MODE=file; TX_FILE=${2:?--tx-file needs a path}; shift 2 ;;
+    --reference) TX_MODE=reference; shift ;;
+    --block) BLOCK=${2:?--block needs a number}; shift 2 ;;
+    --keep) KEEP=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option '$1' (see --help)" ;;
+  esac
+done
+
+need_tools
+SAFE=$(cast to-check-sum-address "$SAFE_ARG" 2>/dev/null) || die "'$SAFE_ARG' is not an address"
+[[ -z $TX_FILE || -r $TX_FILE ]] || die "cannot read $TX_FILE"
+[[ -n $BLOCK ]] || BLOCK=$(cast block-number --rpc-url "$ETH_RPC_URL")
+BLOCK_TIME=$(cast block "$BLOCK" --field timestamp --rpc-url "$ETH_RPC_URL")
+
+[[ $(cast code "$SAFE" --block "$BLOCK" --rpc-url "$ETH_RPC_URL") != 0x ]] || die "$SAFE has no code on mainnet at block $BLOCK"
+NONCE=$(cast call "$SAFE" 'nonce()(uint256)' --block "$BLOCK" --rpc-url "$ETH_RPC_URL" | cut -d' ' -f1) \
+  || die "$SAFE does not answer nonce(); is it a Safe?"
+
+RUN_DIR="runs/${SAFE}-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$RUN_DIR"
+
+echo "${BOLD}Safe upgrade dry-run${RESET}"
+echo "         Safe             $SAFE"
+echo "         fork of          mainnet block $BLOCK ($(date -u -d "@$BLOCK_TIME" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "timestamp $BLOCK_TIME")) via $(rpc_host)"
+echo "         run directory    $RUN_DIR"
+
+# ----------------------------------------------------------------- pick the transaction
+
+normalise_tx() { # stdin: loosely-typed tx JSON; $1: origin label
+  jq --arg origin "$1" --arg zero "$ZERO" --arg nonce "$NONCE" '{
+    origin: $origin,
+    to: .to,
+    value: ((.value // 0) | tostring),
+    data: (.data // "0x"),
+    operation: ((.operation // 0) | tostring),
+    safeTxGas: ((.safeTxGas // 0) | tostring),
+    baseGas: ((.baseGas // 0) | tostring),
+    gasPrice: ((.gasPrice // 0) | tostring),
+    gasToken: (.gasToken // $zero),
+    refundReceiver: (.refundReceiver // $zero),
+    nonce: ((.nonce // $nonce) | tostring),
+    safeTxHash: (.safeTxHash // "")
+  }'
+}
+
+SERVICE_NOTES=()
+case $TX_MODE in
+  reference)
+    note "No proposed transaction requested: rehearsing the reference upgrade batch."
+    ;;
+  file)
+    normalise_tx "file $TX_FILE" <"$TX_FILE" >"$RUN_DIR/tx.json" || die "$TX_FILE is not usable transaction JSON"
+    [[ $(jq -r '.to // empty' "$RUN_DIR/tx.json") =~ ^0x[0-9a-fA-F]{40}$ ]] || die "$TX_FILE has no valid 'to' address"
+    ;;
+  service)
+    AUTH=()
+    [[ -z ${SAFE_API_KEY:-} ]] || AUTH=(-H "Authorization: Bearer $SAFE_API_KEY")
+    URL="$TX_SERVICE/api/v2/safes/$SAFE/multisig-transactions/?executed=false&nonce__gte=$NONCE&limit=100"
+    curl -fsS -m 60 "${AUTH[@]}" "$URL" >"$RUN_DIR/queue.json" \
+      || die "Safe Transaction Service request failed. Use --tx-file or --reference, or set SAFE_API_KEY."
+    if [[ -n $TX_HASH ]]; then
+      PICK=$(jq -c --arg h "${TX_HASH,,}" '[.results[] | select((.safeTxHash | ascii_downcase) == $h)]' "$RUN_DIR/queue.json")
+      [[ $(jq length <<<"$PICK") == 1 ]] || die "no queued transaction with safeTxHash $TX_HASH for this Safe"
+    else
+      PICK=$(jq -c --argjson n "$NONCE" '[.results[] | select((.nonce | tonumber) == $n)]' "$RUN_DIR/queue.json")
+      case $(jq length <<<"$PICK") in
+        1) ;;
+        0) die "no queued transaction at the Safe's current nonce ($NONCE). Propose the upgrade in the Safe UI first, or rehearse the expected batch with --reference." ;;
+        *) echo "Several transactions are queued at nonce $NONCE; choose one with --tx-hash:" >&2
+           jq -r '.[] | "  \(.safeTxHash)  to \(.to)  proposed \(.submissionDate)"' <<<"$PICK" >&2
+           exit 2 ;;
+      esac
+    fi
+    jq '.[0]' <<<"$PICK" | normalise_tx "Safe Transaction Service, proposed $(jq -r '.[0].submissionDate' <<<"$PICK")" >"$RUN_DIR/tx.json"
+    TX_NONCE=$(jq -r .nonce "$RUN_DIR/tx.json")
+    SERVICE_NOTES+=("confirmations so far: $(jq -r '.[0] | "\(.confirmations | length) of \(.confirmationsRequired)"' <<<"$PICK")")
+    LATER=$(jq --argjson n "$TX_NONCE" '[.results[] | select((.nonce | tonumber) > $n)] | length' "$RUN_DIR/queue.json")
+    RIVALS=$(jq --argjson n "$TX_NONCE" '[.results[] | select((.nonce | tonumber) == $n)] | length - 1' "$RUN_DIR/queue.json")
+    [[ $RIVALS -le 0 ]] || SERVICE_NOTES+=("[WARN] $RIVALS other transaction(s) are queued at the same nonce; only one of them can execute")
+    [[ $LATER -le 0 ]] || SERVICE_NOTES+=("[WARN] $LATER transaction(s) are queued at later nonces: the upgrade changes the signing domain, so they must be re-proposed and re-signed afterwards")
+    ;;
+esac
+[[ $TX_MODE == reference ]] || TX_MODE=file
+
+# ------------------------------------------------------------------------ start the fork
+
+ANVIL_PID=''
+cleanup() { [[ -z $ANVIL_PID ]] || kill "$ANVIL_PID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+anvil --fork-url "$ETH_RPC_URL" --fork-block-number "$BLOCK" --chain-id "$FORK_CHAIN_ID" \
+  --host 127.0.0.1 --port 0 --auto-impersonate --no-storage-caching >"$RUN_DIR/anvil.log" 2>&1 &
+ANVIL_PID=$!
+
+FORK_URL=''
+for _ in $(seq 100); do
+  kill -0 "$ANVIL_PID" 2>/dev/null || { tail -5 "$RUN_DIR/anvil.log" >&2; die "anvil exited during startup"; }
+  PORT=$(sed -nE 's/^Listening on 127\.0\.0\.1:([0-9]+)$/\1/p' "$RUN_DIR/anvil.log")
+  if [[ -n $PORT ]]; then FORK_URL="http://127.0.0.1:$PORT"; break; fi
+  sleep 0.1
+done
+[[ -n $FORK_URL ]] || die "anvil did not start listening"
+[[ $(cast chain-id --rpc-url "$FORK_URL") == "$FORK_CHAIN_ID" ]] || die "fork reports an unexpected chain id"
+
+# Impersonated owners need gas money; give it to those that have none. Owner balances are not
+# part of the Safe's state, and the report says which accounts were topped up.
+mapfile -t OWNERS < <(cast call "$SAFE" 'getOwners()(address[])' --rpc-url "$FORK_URL" | tr -d '[] ' | tr ',' '\n' | tr 'A-F' 'a-f' | sort)
+[[ ${#OWNERS[@]} -gt 0 ]] || die "$SAFE has no owners; is it a Safe?"
+FUNDED=()
+for o in "${OWNERS[@]}"; do
+  if [[ $(cast balance "$o" --rpc-url "$FORK_URL") -lt 1000000000000000000 ]] 2>/dev/null; then
+    cast rpc anvil_setBalance "$o" 0x56bc75e2d63100000 --rpc-url "$FORK_URL" >/dev/null
+    FUNDED+=("$o")
+  fi
+done
+
+# ------------------------------------------------------------------------------ phases
+
+export SAFE RUN_DIR TX_MODE
+run_phase() { # $1: contract, $2: phase name, rest: extra forge args
+  local contract=$1 phase=$2; shift 2
+  if ! forge script "script/$contract.s.sol:$contract" --rpc-url "$FORK_URL" "$@" >"$RUN_DIR/forge-$phase.log" 2>&1; then
+    [[ ! -f $RUN_DIR/report-$phase.txt ]] || colourise <"$RUN_DIR/report-$phase.txt"
+    echo
+    tail -25 "$RUN_DIR/forge-$phase.log" >&2
+    return 1
+  fi
+  colourise <"$RUN_DIR/report-$phase.txt"
+}
+
+note "Rehearsing the transaction and replaying it on the fork..."
+run_phase Execute execute --broadcast --unlocked --sender "${OWNERS[0]}" --slow \
+  || die "the rehearsal aborted; full log in $RUN_DIR/forge-execute.log"
+
+if [[ ${#SERVICE_NOTES[@]} -gt 0 || ${#FUNDED[@]} -gt 0 ]]; then
+  echo; echo "== Notes ==" | colourise
+  for n in "${SERVICE_NOTES[@]}"; do
+    [[ $n == \[WARN\]* ]] && echo "  $n" | colourise || echo "         $n"
+  done
+  [[ ${#FUNDED[@]} -eq 0 ]] || echo "         fork-only gas money given to ${#FUNDED[@]} owner account(s) with under 1 ETH"
+fi
+
+EXECUTED=$(jq -r .executed "$RUN_DIR/summary-execute.json")
+if [[ $EXECUTED == true ]]; then
+  note "Checking the upgraded Safe..."
+  if ! run_phase Verify verify; then
+    echo "  [FAIL] the post-upgrade checks aborted: the Safe is not in a state they can even read (log: $RUN_DIR/forge-verify.log)" | tee -a "$RUN_DIR/report-verify.txt" | colourise
+    echo '{"passes":0,"warns":0,"fails":1}' >"$RUN_DIR/summary-verify.json"
+  fi
+else
+  echo '{"passes":0,"warns":0,"fails":0}' >"$RUN_DIR/summary-verify.json"
+fi
+
+# ----------------------------------------------------------------------------- verdict
+
+read -r PASSES WARNS FAILS < <(jq -s -r '[(map(.passes) | add), (map(.warns) | add), (map(.fails) | add)] | @tsv' \
+  "$RUN_DIR/summary-execute.json" "$RUN_DIR/summary-verify.json")
+WARNS=$((WARNS + $(printf '%s\n' "${SERVICE_NOTES[@]}" | grep -c '^\[WARN\]' || true)))
+
+cat "$RUN_DIR"/report-*.txt >"$RUN_DIR/report.txt"
+echo
+if [[ $EXECUTED != true ]]; then
+  echo "${RED}${BOLD}NOT EXECUTED${RESET}  the transaction could not be rehearsed; see the failures above"
+  STATUS=1
+elif [[ $FAILS -gt 0 ]]; then
+  echo "${RED}${BOLD}FAIL${RESET}  $FAILS check(s) failed, $WARNS warning(s), $PASSES passed"
+  STATUS=1
+elif [[ $WARNS -gt 0 ]]; then
+  echo "${YELLOW}${BOLD}PASS WITH WARNINGS${RESET}  $PASSES checks passed, $WARNS warning(s) to read"
+  STATUS=0
+else
+  echo "${GREEN}${BOLD}PASS${RESET}  all $PASSES checks passed"
+  STATUS=0
+fi
+echo "${DIM}Full report and artefacts: $RUN_DIR/${RESET}"
+
+if [[ $KEEP == 1 ]]; then
+  cat <<EOF
+
+${BOLD}Fork left running${RESET} at $FORK_URL (chain id $FORK_CHAIN_ID, any account can be impersonated).
+Do not connect a wallet holding real owner keys to it. Examples:
+  cast call $SAFE 'VERSION()(string)' --rpc-url $FORK_URL
+  cast call $SAFE 'getOwners()(address[])' --rpc-url $FORK_URL
+  cast send $SAFE 'approveHash(bytes32)' <hash> --unlocked --from <owner> --rpc-url $FORK_URL
+Press Ctrl-C to shut it down.
+EOF
+  trap 'cleanup; exit $STATUS' INT TERM
+  wait "$ANVIL_PID" || true
+fi
+exit $STATUS

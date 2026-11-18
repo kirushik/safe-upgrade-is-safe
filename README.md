@@ -125,3 +125,7 @@ With `--full`, additionally:
 - `script/Verify.s.sol` — post-upgrade comparison and smoke tests.
 - `src/SafeConstants.sol` — canonical addresses, storage slots, EIP-712 type hashes.
 - `src/SafeVersions.sol` — what identifies each version and what an upgrade to it leaves behind.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

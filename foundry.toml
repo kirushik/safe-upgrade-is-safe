@@ -1,0 +1,16 @@
+[profile.default]
+src = "src"
+script = "script"
+test = "test"
+out = "out"
+libs = ["lib"]
+evm_version = "prague"
+optimizer = false
+# Scripts write reports and read fetched transactions; nothing else on disk.
+fs_permissions = [{ access = "read-write", path = "./runs" }]
+# The scripts call their own external functions to turn reverts into report lines; the script
+# address is never used on-chain.
+script_execution_protection = false
+
+[fmt]
+line_length = 110

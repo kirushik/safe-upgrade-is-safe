@@ -314,7 +314,10 @@ run_phase() { # $1: contract, $2: phase name, rest: extra forge args
 }
 
 note "Rehearsing the transaction and replaying it on the fork..."
-run_phase Execute execute --broadcast --unlocked --sender "${OWNERS[0]}" --slow \
+# forge sizes gas limits from its own simulation, where the rehearsal has already warmed every
+# account and slot. Give the real, cold transactions generous headroom: the limit costs nothing
+# on the fork, and the gas actually used is reported below.
+run_phase Execute execute --broadcast --unlocked --sender "${OWNERS[0]}" --slow --gas-estimate-multiplier 500 \
   || die "the rehearsal aborted; full log in $RUN_DIR/forge-execute.log"
 
 if [[ $QUEUED_LATER -gt 0 ]]; then
@@ -325,11 +328,24 @@ if [[ $QUEUED_LATER -gt 0 ]]; then
   fi
 fi
 
-if [[ ${#SERVICE_NOTES[@]} -gt 0 || ${#FUNDED[@]} -gt 0 ]]; then
+GAS_NOTE=''
+RECEIPTS=broadcast/Execute.s.sol/$FORK_CHAIN_ID/run-latest.json
+if [[ $(jq -r .executed "$RUN_DIR/summary-execute.json") == true && -r $RECEIPTS ]]; then
+  cp "$RECEIPTS" "$RUN_DIR/broadcast.json"
+  GAS_USED=$(jq -r '.receipts[-1].gasUsed // empty' "$RECEIPTS")
+  SAFE_TX_GAS=$(jq -r .safeTxGas "$RUN_DIR/tx.json")
+  if [[ -n $GAS_USED ]]; then
+    GAS_NOTE="execTransaction used $((GAS_USED)) gas on the fork from cold state, as it would on mainnet"
+    [[ $SAFE_TX_GAS == 0 ]] || GAS_NOTE+="; safeTxGas caps the inner call at $SAFE_TX_GAS"
+  fi
+fi
+
+if [[ ${#SERVICE_NOTES[@]} -gt 0 || ${#FUNDED[@]} -gt 0 || -n $GAS_NOTE ]]; then
   echo; echo "== Notes ==" | colourise
   for n in "${SERVICE_NOTES[@]}"; do
     [[ $n == \[WARN\]* ]] && echo "  $n" | colourise || echo "         $n"
   done
+  [[ -z $GAS_NOTE ]] || echo "         $GAS_NOTE"
   [[ ${#FUNDED[@]} -eq 0 ]] || echo "         fork-only gas money given to ${#FUNDED[@]} owner account(s) with under 1 ETH"
 fi
 

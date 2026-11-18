@@ -75,6 +75,9 @@ contract Verify is DryRunBase {
         _printSnapshot(afterward);
 
         section("Upgrade result");
+        if (afterward.singleton == before.singleton && afterward.nonce == before.nonce + 1) {
+            fail("the transaction was mined on the fork but its inner call failed: the nonce is used up and nothing was upgraded. On a pre-1.3.0 Safe this is what too small a safeTxGas does, and it would happen on mainnet too");
+        }
         check(afterward.singleton == expSingleton, string.concat("storage slot 0 is exactly the ", _name(expSingleton)));
         check(safe.masterCopy() == expSingleton, "proxy's masterCopy() returns the new singleton");
         check(keccak256(bytes(afterward.version)) == keccak256(bytes(tgt.version)), string.concat("VERSION() is ", tgt.version));
